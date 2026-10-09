@@ -1,0 +1,24 @@
+# Данные базы знаний (source of truth и кэши) — runtime, не для git
+data/
+*.jsonl
+*.emb.npz
+*.emb.npz.meta.json
+*_fts.db
+*_fts.db-wal
+*_fts.db-shm
+*_state.json
+
+# Модели и окружение (тяжёлые: .hf-cache ~4.3 ГБ, .venv ~1.4 ГБ)
+.hf-cache/
+.venv/
+__pycache__/
+*.pyc
+
+# Секреты
+.env
+sessions/
+
+# Исследование (история решений) — в репозиторий не пакуется: только инструмент,
+# инструкции, адаптеры и документация
+research/
+REPORT.md

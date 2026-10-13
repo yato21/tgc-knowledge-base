@@ -29,17 +29,21 @@ import numpy as np
 # --------------------------------------------------------------------------- данные
 
 def load_posts(path: Path) -> list[dict]:
-    posts = []
+    """Семантика должна совпадать с kb_search.load_posts: ВСЕ посты (включая без
+    текста), дедуп по id (последний в файле выигрывает), сортировка. Фильтр пустых
+    текстов здесь давал корпус 4889 vs 4967 у kb_search — кэш эмбеддингов не
+    принимался поиском никогда (расхождение найдено при перекодировке 2026-10-09)."""
+    result: dict[int, dict] = {}
     for line in path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line:
             continue
-        rec = json.loads(line)
-        text = (rec.get("text") or "").strip()
-        if text:
-            posts.append(rec)
-    posts.sort(key=lambda p: p["id"])
-    return posts
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        result[rec["id"]] = rec
+    return [result[k] for k in sorted(result)]
 
 
 def load_questions(path: Path) -> list[dict]:
@@ -84,8 +88,13 @@ def build_dense_index(posts: list[dict], model_name: str, hf_home: str | None, b
     if cache_path is not None:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(cache_path, emb=emb)
+        # hash обязателен: kb_search.load_dense проверяет ids И hash(текстов);
+        # meta без hash считалась бы валидной при правке текста поста
+        from kb_search import corpus_hash
         meta_path.write_text(json.dumps({"key": corpus_key, "model": model_name,
-                                         "ids": [p["id"] for p in posts]}, ensure_ascii=False), encoding="utf-8")
+                                         "ids": [p["id"] for p in posts],
+                                         "hash": corpus_hash({p["id"]: p for p in posts})},
+                                        ensure_ascii=False), encoding="utf-8")
         print(f"Эмбеддинги сохранены в кэш: {cache_path}")
     return model, emb, load_s, encode_s
 

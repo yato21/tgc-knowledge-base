@@ -407,11 +407,15 @@ def cmd_update(args) -> int:
 
     # 1) докачиваем назад, пока не встретим сохранённое
     page_min = min(fetched)
-    overlap_reached = state["max_id"] is not None and page_min <= state["max_id"]
+    known_max = state["max_id"]
+    overlap_reached = known_max is not None and page_min <= known_max
     if not overlap_reached:
-        def stop_all(posts: list[dict]) -> bool:
-            return False
-        older, pages = walk_pages(args.channel, page_min, stop_all, args.delay, limit_pages - pages_total)
+        # стоп: страница дошла до постов, уже известных корпусу (иначе —
+        # прогулка по всей истории канала; найдено при update 2026-10-09:
+        # 257 страниц, +2055 постов вместо инкремента)
+        def stop_at_known(posts: list[dict]) -> bool:
+            return any(p["id"] <= known_max for p in posts) if known_max is not None else False
+        older, pages = walk_pages(args.channel, page_min, stop_at_known, args.delay, limit_pages - pages_total)
         pages_total += pages
         for p in older:
             fetched[p["id"]] = p

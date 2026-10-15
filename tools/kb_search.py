@@ -253,8 +253,22 @@ def load_dense(channel: str, dd: Path, posts: dict[int, dict]):
     return model, emb, ids
 
 
+_IMG_URL_RE = re.compile(r"^\s*https?://\S+\.(?:jpg|jpeg|png|webp|gif|avif|heic)(\?\S*)?\s*$", re.IGNORECASE)
+
+
+def encode_text(text: str) -> str:
+    """Текст, безопасный для эмбеддинга. Пост, состоящий только из ссылки на картинку,
+    sentence-transformers для мультимодальных моделей трактует как изображение и падает
+    на декодировании (найдено на EmbeddingGemma 2, пост 100 — голый fbcdn-URL).
+    Заменяем нейтральной пометкой: семантики у такого поста всё равно нет."""
+    t = (text or "").strip()
+    if _IMG_URL_RE.match(t):
+        return "[изображение]"
+    return text
+
+
 def dense_search(query: str, model, emb, ids: list[int], top_k: int = 5) -> list[tuple[int, float]]:
-    q = model.encode([query], normalize_embeddings=True, show_progress_bar=False)
+    q = model.encode([encode_text(query)], normalize_embeddings=True, show_progress_bar=False)
     import numpy as np
     q = np.asarray(q, dtype=np.float32)[0]
     scores = emb @ q

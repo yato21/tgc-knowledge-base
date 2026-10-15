@@ -54,15 +54,16 @@ def load_questions(path: Path) -> list[dict]:
 # --------------------------------------------------------------------------- dense (bge-m3)
 
 def build_dense_index(posts: list[dict], model_name: str, hf_home: str | None, batch_size: int = 16,
-                      cache_path: Path | None = None):
+                      cache_path: Path | None = None, doc_prompt: str = "", text_only: bool = False):
     """Эмбеддинги корпуса с дисковым кэшем: повторные прогоны не перекодируют 30 минут."""
     import os
     import hashlib
     if hf_home:
         os.environ.setdefault("HF_HOME", hf_home)
 
+    # промпт входит в ключ: тот же корпус с другим промптом даёт другие векторы
     corpus_key = hashlib.sha256(
-        (model_name + "|" + "\x1e".join(p["text"] for p in posts)).encode("utf-8")
+        (model_name + "|" + doc_prompt + "|" + "\x1e".join(p["text"] for p in posts)).encode("utf-8")
     ).hexdigest()[:16]
     if cache_path is not None:
         meta_path = cache_path.with_suffix(".meta.json")
@@ -76,12 +77,16 @@ def build_dense_index(posts: list[dict], model_name: str, hf_home: str | None, b
     from sentence_transformers import SentenceTransformer
 
     t0 = time.time()
-    model = SentenceTransformer(model_name)
+    model = _load_model(model_name, text_only)
     load_s = time.time() - t0
 
-    texts = [p["text"] for p in posts]
+    from kb_search import encode_text
+    # тексты для эмбеддинга санитизируем (голая ссылка на картинку ломает
+    # мультимодальный процессор — пост 100); hash остаётся по raw-текстам
+    texts = [encode_text(p["text"]) for p in posts]
     t0 = time.time()
-    emb = model.encode(texts, batch_size=batch_size, normalize_embeddings=True, show_progress_bar=False)
+    emb = model.encode(texts, batch_size=batch_size, normalize_embeddings=True,
+                       show_progress_bar=False, prompt_name=doc_prompt or None)
     encode_s = time.time() - t0
     emb = np.asarray(emb, dtype=np.float32)
 
@@ -99,7 +104,18 @@ def build_dense_index(posts: list[dict], model_name: str, hf_home: str | None, b
     return model, emb, load_s, encode_s
 
 
-def dense_search(query: str, model, emb: np.ndarray, posts: list[dict], top_k: int = 5) -> list[tuple[int, float]]:
+def _load_model(model_name: str, text_only: bool = False):
+    """text_only: для модульных моделей (EmbeddingGemma 2) — не грузить vision/audio
+    энкодеры (~3× меньше RAM); на обычные модели флага нет — грузим как есть."""
+    from sentence_transformers import SentenceTransformer
+    if text_only:
+        return SentenceTransformer(model_name,
+                                   config_kwargs={"vision_config": None, "audio_config": None})
+    return SentenceTransformer(model_name)
+
+
+def dense_search(query: str, model, emb: np.ndarray, posts: list[dict], top_k: int = 5,
+                 query_prompt: str = "") -> list[tuple[int, float]]:
     """Возвращает (id поста, score) — позиции массива мапятся на реальные id."""
     q = np.asarray(model.encode([query], normalize_embeddings=True, show_progress_bar=False), dtype=np.float32)[0]
     scores = emb @ q  # косинус (нормализованы)
@@ -158,23 +174,30 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--model", default="BAAI/bge-m3")
     ap.add_argument("--hf-home", default=None)
     ap.add_argument("--top-k", type=int, default=5)
+    ap.add_argument("--cache", default=None, help="путь кэша эмбеддингов (по умолчанию — рядом с JSONL); "
+                                                 "разный для разных моделей при A/B")
+    ap.add_argument("--query-prompt", default="", help="prompt_name для запросов (напр. SearchQuery у EmbeddingGemma)")
+    ap.add_argument("--doc-prompt", default="", help="prompt_name для корпуса (напр. Document у EmbeddingGemma)")
+    ap.add_argument("--text-only", action="store_true",
+                    help="модульная модель: грузить только текстовый энкодер (EmbeddingGemma 2)")
     args = ap.parse_args(argv)
 
     posts = load_posts(Path(args.posts))
     questions = load_questions(args.questions)
     print(f"Постов: {len(posts)}; вопросов: {len(questions)}; модель: {args.model}")
 
+    cache = Path(args.cache) if args.cache else Path(args.posts).with_suffix(".emb.npz")
     model, emb, load_s, encode_s = build_dense_index(posts, args.model, args.hf_home,
-                                                     cache_path=Path(args.posts).with_suffix(".emb.npz"))
+                                                     cache_path=cache, doc_prompt=args.doc_prompt,
+                                                     text_only=args.text_only)
     if model is None:
         # кэш-попадание: модель всё равно нужна для кодирования запросов (загрузка ~8 c)
         import os
         if args.hf_home:
             os.environ.setdefault("HF_HOME", args.hf_home)
-        from sentence_transformers import SentenceTransformer
-        t0 = time.time()
-        model = SentenceTransformer(args.model)
-        load_s = time.time() - t0
+        load_s = time.time()
+        model = _load_model(args.model, args.text_only)
+        load_s = time.time() - load_s
     print(f"Модель загружена за {load_s:.0f} c; корпус закодирован за {encode_s:.0f} c; dims={emb.shape[1]}")
 
     conn = build_fts(posts)
@@ -184,6 +207,7 @@ def main(argv: list[str] | None = None) -> int:
         "",
         f"- Дата: {datetime.now(timezone.utc).isoformat(timespec='seconds')}",
         f"- Корпус: {len(posts)} постов (полный текст), модель {args.model}, dims={emb.shape[1]}",
+        f"- Промпты: запрос='{args.query_prompt or '—'}', документ='{args.doc_prompt or '—'}'; text_only={args.text_only}",
         f"- Загрузка модели: {load_s:.0f} c; кодирование корпуса: {encode_s:.0f} c",
         f"- Методы: dense (косинус, brute-force), keyword (FTS5 unicode61, без русского стеммера), hybrid (RRF, k=60)",
         "",
@@ -192,7 +216,8 @@ def main(argv: list[str] | None = None) -> int:
     t_dense = t_kw = 0.0
     for qi, q in enumerate(questions, 1):
         query = q["q"] if isinstance(q, dict) else q
-        t0 = time.time(); dense = dense_search(query, model, emb, posts, args.top_k); t_dense += time.time() - t0
+        t0 = time.time(); dense = dense_search(query, model, emb, posts, args.top_k,
+                                               query_prompt=args.query_prompt); t_dense += time.time() - t0
         t0 = time.time(); kw = keyword_search(conn, query, args.top_k); t_kw += time.time() - t0
         hyb = rrf_fuse(dense, kw, top_k=args.top_k)
 
